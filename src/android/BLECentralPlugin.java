@@ -39,681 +39,294 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import org.json.JSONException;
 
+
+import android.os.Bundle;
+import android.os.Message;
+import android.util.Log;
+
 import java.util.*;
 
-import static android.bluetooth.BluetoothDevice.DEVICE_TYPE_DUAL;
-import static android.bluetooth.BluetoothDevice.DEVICE_TYPE_LE;
 
-public class BLECentralPlugin extends CordovaPlugin implements BluetoothAdapter.LeScanCallback {
+
+public class BLECentralPlugin extends CordovaPlugin{
     // actions
-    private static final String SCAN = "scan";
-    private static final String START_SCAN = "startScan";
-    private static final String STOP_SCAN = "stopScan";
-    private static final String START_SCAN_WITH_OPTIONS = "startScanWithOptions";
-    private static final String BONDED_DEVICES = "bondedDevices";
-    private static final String LIST = "list";
+    private static final String PRINT = "print";
+    public static final String QSPRINTER_NAME = "QSprinter";
+    private static final int REQUEST_ENABLE_BT = 2;
 
-    private static final String CONNECT = "connect";
-    private static final String AUTOCONNECT = "autoConnect";
-    private static final String DISCONNECT = "disconnect";
+    BlueToothService mService = null;
+    CallbackContext callbackContext=null;
 
-    private static final String REQUEST_MTU = "requestMtu";
-    private static final String REFRESH_DEVICE_CACHE = "refreshDeviceCache";
+    boolean alreadyHaveOnePrinterToConnect = false;
+    String msgToPrint = null;
+    int counterForPrintCalling = 0;
+    boolean callPrintInProgress = false;//TODO 在exec方法中设置为true，在异步或者同步回调时使用...
 
-    private static final String READ = "read";
-    private static final String WRITE = "write";
-    private static final String WRITE_WITHOUT_RESPONSE = "writeWithoutResponse";
+    //message
+    private final static String ERROR_MSG_callPrintInProgress = "正在打印，请不要连续按键！";
+    private final static String ERROR_MSG_QSPrinterproblem = "打印机故障，请换一台试试?";
+    private final static String ERROR_MSG_QSPrinterNotFound = "没找到打印机，请确认打印机已开机!";
 
-    private static final String READ_RSSI = "readRSSI";
+    private static final String MESSGE_PRINT_CANCELED = "canceled";//打印取消了
 
-    private static final String START_NOTIFICATION = "startNotification"; // register for characteristic notification
-    private static final String STOP_NOTIFICATION = "stopNotification"; // remove characteristic notification
-
-    private static final String IS_ENABLED = "isEnabled";
-    private static final String IS_CONNECTED  = "isConnected";
-
-    private static final String SETTINGS = "showBluetoothSettings";
-    private static final String ENABLE = "enable";
-
-    private static final String START_STATE_NOTIFICATIONS = "startStateNotifications";
-    private static final String STOP_STATE_NOTIFICATIONS = "stopStateNotifications";
-
-    // callbacks
-    CallbackContext discoverCallback;
-    private CallbackContext enableBluetoothCallback;
-
-    private static final String TAG = "BLEPlugin";
-    private static final int REQUEST_ENABLE_BLUETOOTH = 1;
-
-    BluetoothAdapter bluetoothAdapter;
-
-    // key is the MAC Address
-    Map<String, Peripheral> peripherals = new LinkedHashMap<String, Peripheral>();
-
-    // scan options
-    boolean reportDuplicates = false;
-
-    // Android 23 requires new permissions for BluetoothLeScanner.startScan()
-    private static final String ACCESS_COARSE_LOCATION = Manifest.permission.ACCESS_COARSE_LOCATION;
-    private static final int REQUEST_ACCESS_COARSE_LOCATION = 2;
-    private CallbackContext permissionCallback;
-    private UUID[] serviceUUIDs;
-    private int scanSeconds;
-
-    // Bluetooth state notification
-    CallbackContext stateCallback;
-    BroadcastReceiver stateReceiver;
-    Map<Integer, String> bluetoothStates = new Hashtable<Integer, String>() {{
-        put(BluetoothAdapter.STATE_OFF, "off");
-        put(BluetoothAdapter.STATE_TURNING_OFF, "turningOff");
-        put(BluetoothAdapter.STATE_ON, "on");
-        put(BluetoothAdapter.STATE_TURNING_ON, "turningOn");
-    }};
-
-    public void onDestroy() {
-        removeStateListener();
-    }
-
-    public void onReset() {
-        removeStateListener();
+    private void callback(boolean success, String message) {
+        Log.i("Bluetooth", success + ":" + message);
+        reset();
+        if (success) {
+            callbackContext.success();
+        } else {
+            callbackContext.error(message);
+        }
     }
 
     @Override
     public boolean execute(String action, CordovaArgs args, CallbackContext callbackContext) throws JSONException {
-        LOG.d(TAG, "action = " + action);
-
-        if (bluetoothAdapter == null) {
-            Activity activity = cordova.getActivity();
-            boolean hardwareSupportsBLE = activity.getApplicationContext()
-                                            .getPackageManager()
-                                            .hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE) &&
-                                            Build.VERSION.SDK_INT >= 18;
-            if (!hardwareSupportsBLE) {
-              LOG.w(TAG, "This hardware does not support Bluetooth Low Energy.");
-              callbackContext.error("This hardware does not support Bluetooth Low Energy.");
-              return false;
-            }
-            BluetoothManager bluetoothManager = (BluetoothManager) activity.getSystemService(Context.BLUETOOTH_SERVICE);
-            bluetoothAdapter = bluetoothManager.getAdapter();
-        }
-
+        LOG.d("BLECentralPlugin", "action = " + action);
         boolean validAction = true;
+        this.callbackContext=callbackContext;
 
-        if (action.equals(SCAN)) {
-
-            UUID[] serviceUUIDs = parseServiceUUIDList(args.getJSONArray(0));
-            int scanSeconds = args.getInt(1);
-            resetScanOptions();
-            findLowEnergyDevices(callbackContext, serviceUUIDs, scanSeconds);
-
-        } else if (action.equals(START_SCAN)) {
-
-            UUID[] serviceUUIDs = parseServiceUUIDList(args.getJSONArray(0));
-            resetScanOptions();
-            findLowEnergyDevices(callbackContext, serviceUUIDs, -1);
-
-        } else if (action.equals(STOP_SCAN)) {
-
-            bluetoothAdapter.stopLeScan(this);
-            callbackContext.success();
-
-        } else if (action.equals(LIST)) {
-
-            listKnownDevices(callbackContext);
-
-        } else if (action.equals(CONNECT)) {
-
-            String macAddress = args.getString(0);
-            connect(callbackContext, macAddress);
-
-        } else if (action.equals(AUTOCONNECT)) {
-
-            String macAddress = args.getString(0);
-            autoConnect(callbackContext, macAddress);
-
-        } else if (action.equals(DISCONNECT)) {
-
-            String macAddress = args.getString(0);
-            disconnect(callbackContext, macAddress);
-
-        } else if (action.equals(REQUEST_MTU)) {
-
-            String macAddress = args.getString(0);
-            int mtuValue = args.getInt(1);
-            requestMtu(callbackContext, macAddress, mtuValue);
-
-        } else if (action.equals(REFRESH_DEVICE_CACHE)) {
-
-            String macAddress = args.getString(0);
-            long timeoutMillis = args.getLong(1);
-
-            refreshDeviceCache(callbackContext, macAddress, timeoutMillis);
-
-        } else if (action.equals(READ)) {
-
-            String macAddress = args.getString(0);
-            UUID serviceUUID = uuidFromString(args.getString(1));
-            UUID characteristicUUID = uuidFromString(args.getString(2));
-            read(callbackContext, macAddress, serviceUUID, characteristicUUID);
-
-        } else if (action.equals(READ_RSSI)) {
-
-            String macAddress = args.getString(0);
-            readRSSI(callbackContext, macAddress);
-
-        } else if (action.equals(WRITE)) {
-
-            String macAddress = args.getString(0);
-            UUID serviceUUID = uuidFromString(args.getString(1));
-            UUID characteristicUUID = uuidFromString(args.getString(2));
-            byte[] data = args.getArrayBuffer(3);
-            int type = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
-            write(callbackContext, macAddress, serviceUUID, characteristicUUID, data, type);
-
-        } else if (action.equals(WRITE_WITHOUT_RESPONSE)) {
-
-            String macAddress = args.getString(0);
-            UUID serviceUUID = uuidFromString(args.getString(1));
-            UUID characteristicUUID = uuidFromString(args.getString(2));
-            byte[] data = args.getArrayBuffer(3);
-            int type = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE;
-            write(callbackContext, macAddress, serviceUUID, characteristicUUID, data, type);
-
-        } else if (action.equals(START_NOTIFICATION)) {
-
-            String macAddress = args.getString(0);
-            UUID serviceUUID = uuidFromString(args.getString(1));
-            UUID characteristicUUID = uuidFromString(args.getString(2));
-            registerNotifyCallback(callbackContext, macAddress, serviceUUID, characteristicUUID);
-
-        } else if (action.equals(STOP_NOTIFICATION)) {
-
-            String macAddress = args.getString(0);
-            UUID serviceUUID = uuidFromString(args.getString(1));
-            UUID characteristicUUID = uuidFromString(args.getString(2));
-            removeNotifyCallback(callbackContext, macAddress, serviceUUID, characteristicUUID);
-
-        } else if (action.equals(IS_ENABLED)) {
-
-            if (bluetoothAdapter.isEnabled()) {
-                callbackContext.success();
-            } else {
-                callbackContext.error("Bluetooth is disabled.");
-            }
-
-        } else if (action.equals(IS_CONNECTED)) {
-
-            String macAddress = args.getString(0);
-
-            if (peripherals.containsKey(macAddress) && peripherals.get(macAddress).isConnected()) {
-                callbackContext.success();
-            } else {
-                callbackContext.error("Not connected.");
-            }
-
-        } else if (action.equals(SETTINGS)) {
-
-            Intent intent = new Intent(Settings.ACTION_BLUETOOTH_SETTINGS);
-            cordova.getActivity().startActivity(intent);
-            callbackContext.success();
-
-        } else if (action.equals(ENABLE)) {
-
-            enableBluetoothCallback = callbackContext;
-            Intent intent = new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE);
-            cordova.startActivityForResult(this, intent, REQUEST_ENABLE_BLUETOOTH);
-
-        } else if (action.equals(START_STATE_NOTIFICATIONS)) {
-
-            if (this.stateCallback != null) {
-                callbackContext.error("State callback already registered.");
-            } else {
-                this.stateCallback = callbackContext;
-                addStateListener();
-                sendBluetoothStateChange(bluetoothAdapter.getState());
-            }
-
-        } else if (action.equals(STOP_STATE_NOTIFICATIONS)) {
-
-            if (this.stateCallback != null) {
-                // Clear callback in JavaScript without actually calling it
-                PluginResult result = new PluginResult(PluginResult.Status.NO_RESULT);
-                result.setKeepCallback(false);
-                this.stateCallback.sendPluginResult(result);
-                this.stateCallback = null;
-            }
-            removeStateListener();
-            callbackContext.success();
-
-        } else if (action.equals(START_SCAN_WITH_OPTIONS)) {
-            UUID[] serviceUUIDs = parseServiceUUIDList(args.getJSONArray(0));
-            JSONObject options = args.getJSONObject(1);
-
-            resetScanOptions();
-            this.reportDuplicates = options.optBoolean("reportDuplicates", false);
-            findLowEnergyDevices(callbackContext, serviceUUIDs, -1);
-
-        } else if (action.equals(BONDED_DEVICES)) {
-
-            getBondedDevices(callbackContext);
-
+        if (action.equals(PRINT)) {
+            String message = args.getString(0);
+            print(message); //printtest();
         } else {
-
             validAction = false;
-
         }
-
         return validAction;
     }
 
-    private void getBondedDevices(CallbackContext callbackContext) {
-        JSONArray bonded = new JSONArray();
-        Set<BluetoothDevice> bondedDevices =  bluetoothAdapter.getBondedDevices();
-
-        for (BluetoothDevice device : bondedDevices) {
-            device.getBondState();
-            int type = device.getType();
-
-            // just low energy devices (filters out classic and unknown devices)
-            if (type == DEVICE_TYPE_LE || type == DEVICE_TYPE_DUAL) {
-                Peripheral p = new Peripheral(device);
-                bonded.put(p.asJSONObject());
-            }
-        }
-
-        callbackContext.success(bonded);
-    }
-
-    private UUID[] parseServiceUUIDList(JSONArray jsonArray) throws JSONException {
-        List<UUID> serviceUUIDs = new ArrayList<UUID>();
-
-        for(int i = 0; i < jsonArray.length(); i++){
-            String uuidString = jsonArray.getString(i);
-            serviceUUIDs.add(uuidFromString(uuidString));
-        }
-
-        return serviceUUIDs.toArray(new UUID[jsonArray.length()]);
-    }
-
-    private void onBluetoothStateChange(Intent intent) {
-        final String action = intent.getAction();
-
-        if (action.equals(BluetoothAdapter.ACTION_STATE_CHANGED)) {
-            final int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
-            sendBluetoothStateChange(state);
+    /**
+     * 最终的接口
+     **/
+    protected void print(String msg) {
+        if ((msg.length() > 0 && !callPrintInProgress)) {
+            this.msgToPrint = msg;
+            counterForPrintCalling = 0;
+            this.alreadyHaveOnePrinterToConnect = false;
+            print();
+        } else {
+            callback(false, ERROR_MSG_callPrintInProgress);
         }
     }
 
-    private void sendBluetoothStateChange(int state) {
-        if (this.stateCallback != null) {
-            PluginResult result = new PluginResult(PluginResult.Status.OK, this.bluetoothStates.get(state));
-            result.setKeepCallback(true);
-            this.stateCallback.sendPluginResult(result);
+    private void print() {
+        if (counterForPrintCalling++ > 2) {
+            callback(false, ERROR_MSG_QSPrinterproblem);
         }
-    }
-
-    private void addStateListener() {
-        if (this.stateReceiver == null) {
-            this.stateReceiver = new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context context, Intent intent) {
-                    onBluetoothStateChange(intent);
-                }
-            };
-        }
-
         try {
-            IntentFilter intentFilter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
-            webView.getContext().registerReceiver(this.stateReceiver, intentFilter);
+            mService.sendMessage(msgToPrint + "\n", "GBK");
+            Log.v("QSPrinter===",msgToPrint);
         } catch (Exception e) {
-            LOG.e(TAG, "Error registering state receiver: " + e.getMessage(), e);
+            //e.printStackTrace();
+            reset();
+            discoverIfNecessary();
         }
     }
 
-    private void removeStateListener() {
-        if (this.stateReceiver != null) {
-            try {
-                webView.getContext().unregisterReceiver(this.stateReceiver);
-            } catch (Exception e) {
-                LOG.e(TAG, "Error unregistering state receiver: " + e.getMessage(), e);
-            }
+    public void reset() {
+        if (mService != null) {
+            mService.cancelDiscovery();
+            mService.stop();
+            mService = null;
         }
-        this.stateCallback = null;
-        this.stateReceiver = null;
-    }
-
-    private void connect(CallbackContext callbackContext, String macAddress) {
-        if (!peripherals.containsKey(macAddress) && BLECentralPlugin.this.bluetoothAdapter.checkBluetoothAddress(macAddress)) {
-            BluetoothDevice device = BLECentralPlugin.this.bluetoothAdapter.getRemoteDevice(macAddress);
-            Peripheral peripheral = new Peripheral(device);
-            peripherals.put(macAddress, peripheral);
-        }
-
-        Peripheral peripheral = peripherals.get(macAddress);
-        if (peripheral != null) {
-            peripheral.connect(callbackContext, cordova.getActivity(), false);
-        } else {
-            callbackContext.error("Peripheral " + macAddress + " not found.");
-        }
-
-    }
-
-    private void autoConnect(CallbackContext callbackContext, String macAddress) {
-        Peripheral peripheral = peripherals.get(macAddress);
-
-        // allow auto-connect to connect to devices without scanning
-        if (peripheral == null) {
-            if (BluetoothAdapter.checkBluetoothAddress(macAddress)) {
-                BluetoothDevice device = bluetoothAdapter.getRemoteDevice(macAddress);
-                peripheral = new Peripheral(device);
-                peripherals.put(device.getAddress(), peripheral);
-            } else {
-                callbackContext.error(macAddress + " is not a valid MAC address.");
-                return;
-            }
-        }
-
-        peripheral.connect(callbackContext, cordova.getActivity(), true);
-
-    }
-
-    private void disconnect(CallbackContext callbackContext, String macAddress) {
-
-        Peripheral peripheral = peripherals.get(macAddress);
-        if (peripheral != null) {
-            peripheral.disconnect();
-            callbackContext.success();
-        } else {
-            String message = "Peripheral " + macAddress + " not found.";
-            LOG.w(TAG, message);
-            callbackContext.error(message);
-        }
-
-    }
-
-    private void requestMtu(CallbackContext callbackContext, String macAddress, int mtuValue) {
-
-        Peripheral peripheral = peripherals.get(macAddress);
-        if (peripheral != null) {
-            peripheral.requestMtu(mtuValue);
-        }
-        callbackContext.success();
-    }
-
-    private void refreshDeviceCache(CallbackContext callbackContext, String macAddress, long timeoutMillis) {
-
-        Peripheral peripheral = peripherals.get(macAddress);
-
-        if (peripheral != null) {
-            peripheral.refreshDeviceCache(callbackContext, timeoutMillis);
-        } else {
-            String message = "Peripheral " + macAddress + " not found.";
-            LOG.w(TAG, message);
-            callbackContext.error(message);
-        }
-    }
-
-    private void read(CallbackContext callbackContext, String macAddress, UUID serviceUUID, UUID characteristicUUID) {
-
-        Peripheral peripheral = peripherals.get(macAddress);
-
-        if (peripheral == null) {
-            callbackContext.error("Peripheral " + macAddress + " not found.");
-            return;
-        }
-
-        if (!peripheral.isConnected()) {
-            callbackContext.error("Peripheral " + macAddress + " is not connected.");
-            return;
-        }
-
-        //peripheral.readCharacteristic(callbackContext, serviceUUID, characteristicUUID);
-        peripheral.queueRead(callbackContext, serviceUUID, characteristicUUID);
-
-    }
-
-    private void readRSSI(CallbackContext callbackContext, String macAddress) {
-
-        Peripheral peripheral = peripherals.get(macAddress);
-
-        if (peripheral == null) {
-            callbackContext.error("Peripheral " + macAddress + " not found.");
-            return;
-        }
-
-        if (!peripheral.isConnected()) {
-            callbackContext.error("Peripheral " + macAddress + " is not connected.");
-            return;
-        }
-        peripheral.queueReadRSSI(callbackContext);
-    }
-
-    private void write(CallbackContext callbackContext, String macAddress, UUID serviceUUID, UUID characteristicUUID,
-                       byte[] data, int writeType) {
-
-        Peripheral peripheral = peripherals.get(macAddress);
-
-        if (peripheral == null) {
-            callbackContext.error("Peripheral " + macAddress + " not found.");
-            return;
-        }
-
-        if (!peripheral.isConnected()) {
-            callbackContext.error("Peripheral " + macAddress + " is not connected.");
-            return;
-        }
-
-        //peripheral.writeCharacteristic(callbackContext, serviceUUID, characteristicUUID, data, writeType);
-        peripheral.queueWrite(callbackContext, serviceUUID, characteristicUUID, data, writeType);
-
-    }
-
-    private void registerNotifyCallback(CallbackContext callbackContext, String macAddress, UUID serviceUUID, UUID characteristicUUID) {
-
-        Peripheral peripheral = peripherals.get(macAddress);
-        if (peripheral != null) {
-
-            if (!peripheral.isConnected()) {
-                callbackContext.error("Peripheral " + macAddress + " is not connected.");
-                return;
-            }
-
-            //peripheral.setOnDataCallback(serviceUUID, characteristicUUID, callbackContext);
-            peripheral.queueRegisterNotifyCallback(callbackContext, serviceUUID, characteristicUUID);
-
-        } else {
-
-            callbackContext.error("Peripheral " + macAddress + " not found");
-
-        }
-
-    }
-
-    private void removeNotifyCallback(CallbackContext callbackContext, String macAddress, UUID serviceUUID, UUID characteristicUUID) {
-
-        Peripheral peripheral = peripherals.get(macAddress);
-        if (peripheral != null) {
-
-            if (!peripheral.isConnected()) {
-                callbackContext.error("Peripheral " + macAddress + " is not connected.");
-                return;
-            }
-
-            peripheral.queueRemoveNotifyCallback(callbackContext, serviceUUID, characteristicUUID);
-
-        } else {
-
-            callbackContext.error("Peripheral " + macAddress + " not found");
-
-        }
-
-    }
-
-    private void findLowEnergyDevices(CallbackContext callbackContext, UUID[] serviceUUIDs, int scanSeconds) {
-
-        if (!locationServicesEnabled()) {
-            callbackContext.error("Location Services are disabled");
-            return;
-        }
-
-        if(!PermissionHelper.hasPermission(this, ACCESS_COARSE_LOCATION)) {
-            // save info so we can call this method again after permissions are granted
-            permissionCallback = callbackContext;
-            this.serviceUUIDs = serviceUUIDs;
-            this.scanSeconds = scanSeconds;
-            PermissionHelper.requestPermission(this, REQUEST_ACCESS_COARSE_LOCATION, ACCESS_COARSE_LOCATION);
-            return;
-        }
-
-        // return error if already scanning
-        if (bluetoothAdapter.isDiscovering()) {
-            LOG.w(TAG, "Tried to start scan while already running.");
-            callbackContext.error("Tried to start scan while already running.");
-            return;
-        }
-
-        // clear non-connected cached peripherals
-        for(Iterator<Map.Entry<String, Peripheral>> iterator = peripherals.entrySet().iterator(); iterator.hasNext(); ) {
-            Map.Entry<String, Peripheral> entry = iterator.next();
-            Peripheral device = entry.getValue();
-            boolean connecting = device.isConnecting();
-            if (connecting){
-                LOG.d(TAG, "Not removing connecting device: " + device.getDevice().getAddress());
-            }
-            if(!entry.getValue().isConnected() && !connecting) {
-                iterator.remove();
-            }
-        }
-
-        discoverCallback = callbackContext;
-
-        if (serviceUUIDs != null && serviceUUIDs.length > 0) {
-            bluetoothAdapter.startLeScan(serviceUUIDs, this);
-        } else {
-            bluetoothAdapter.startLeScan(this);
-        }
-
-        if (scanSeconds > 0) {
-            Handler handler = new Handler();
-            handler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    LOG.d(TAG, "Stopping Scan");
-                    BLECentralPlugin.this.bluetoothAdapter.stopLeScan(BLECentralPlugin.this);
-                }
-            }, scanSeconds * 1000);
-        }
-
-        PluginResult result = new PluginResult(PluginResult.Status.NO_RESULT);
-        result.setKeepCallback(true);
-        callbackContext.sendPluginResult(result);
-    }
-
-    private boolean locationServicesEnabled() {
-        int locationMode = 0;
         try {
-            locationMode = Settings.Secure.getInt(cordova.getActivity().getContentResolver(), Settings.Secure.LOCATION_MODE);
-        } catch (Settings.SettingNotFoundException e) {
-            LOG.e(TAG, "Location Mode Setting Not Found", e);
+            webView.getContext().unregisterReceiver(mReceiver);
+        } catch (Exception e) {
+
         }
-        return (locationMode > 0);
+        this.alreadyHaveOnePrinterToConnect = false;
+        this.counterForPrintCalling = 0;
     }
 
-    private void listKnownDevices(CallbackContext callbackContext) {
 
-        JSONArray json = new JSONArray();
-
-        // do we care about consistent order? will peripherals.values() be in order?
-        for (Map.Entry<String, Peripheral> entry : peripherals.entrySet()) {
-            Peripheral peripheral = entry.getValue();
-            if (!peripheral.isUnscanned()) {
-                json.put(peripheral.asJSONObject());
+    private void discoverIfNecessary() {
+        mService = new BlueToothService(null, mHandler);
+        if (!mService.isAvailable() || !mService.isBTopen()) {
+            //蓝牙未开…
+            Intent enableIntent = new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE);
+            cordova.startActivityForResult(this,enableIntent, REQUEST_ENABLE_BT);
+        } else {//链接QSPrinter// 1注册receiver
+            boolean qsprinterpaired = false;//是否已有配对的打印机
+            Set<BluetoothDevice> pairedDevices = mService.getPairedDev();
+            // If there are paired devices, add each one to the ArrayAdapter
+            if (pairedDevices.size() > 0) {
+                for (BluetoothDevice device : pairedDevices) {
+                    if (QSPRINTER_NAME.equals(device.getName())) {
+                        qsprinterpaired = true;
+                        connectPrinter(device);
+                        break;
+                    }
+                }
+                if (!qsprinterpaired) {
+                    IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_FOUND);
+                    webView.getContext().registerReceiver(mReceiver, filter);
+                    filter = new IntentFilter(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
+                    webView.getContext().registerReceiver(mReceiver, filter);
+                    if (mService.isDiscovering()) {//2发现QSPrinter
+                        mService.cancelDiscovery();
+                    }
+                    mService.startDiscovery();
+                }
             }
         }
-
-        PluginResult result = new PluginResult(PluginResult.Status.OK, json);
-        callbackContext.sendPluginResult(result);
     }
 
     @Override
-    public void onLeScan(BluetoothDevice device, int rssi, byte[] scanRecord) {
+    public void onDestroy() {
+        super.onDestroy();
+        reset();
+    }
 
-        String address = device.getAddress();
-        boolean alreadyReported = peripherals.containsKey(address) && !peripherals.get(address).isUnscanned();
 
-        if (!alreadyReported) {
-
-            Peripheral peripheral = new Peripheral(device, rssi, scanRecord);
-            peripherals.put(device.getAddress(), peripheral);
-
-            if (discoverCallback != null) {
-                PluginResult result = new PluginResult(PluginResult.Status.OK, peripheral.asJSONObject());
-                result.setKeepCallback(true);
-                discoverCallback.sendPluginResult(result);
+    // The BroadcastReceiver that listens for discovered devices and
+    // changes the title when discovery is finished
+    private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            // When discovery finds a device
+            if (BluetoothDevice.ACTION_FOUND.equals(action)) {
+                // Get the BluetoothDevice object from the Intent
+                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                // If it's already paired, skip it, because it's been listed already
+                if (device.getBondState() != BluetoothDevice.BOND_BONDED && QSPRINTER_NAME.equals(device.getName())) {//
+                    //获取列表项中设备的mac地址
+                    connectPrinter(device);
+                }
+                // When discovery is finished, change the Activity title
+            } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
+                callback(false, ERROR_MSG_QSPrinterNotFound);
             }
+        }
+    };
 
-        } else {
-            Peripheral peripheral = peripherals.get(address);
-            peripheral.update(rssi, scanRecord);
-            if (reportDuplicates && discoverCallback != null) {
-                PluginResult result = new PluginResult(PluginResult.Status.OK, peripheral.asJSONObject());
-                result.setKeepCallback(true);
-                discoverCallback.sendPluginResult(result);
-            }
+    private void connectPrinter(BluetoothDevice device) {
+        BluetoothDevice con_dev = mService.getDevByMac(device.getAddress());
+        if (!alreadyHaveOnePrinterToConnect) {
+            alreadyHaveOnePrinterToConnect = true;
+            mService.connect(con_dev);
         }
     }
 
     @Override
     public void onActivityResult(int requestCode, int resultCode, Intent data) {
-
-        if (requestCode == REQUEST_ENABLE_BLUETOOTH) {
-
-            if (resultCode == Activity.RESULT_OK) {
-                LOG.d(TAG, "User enabled Bluetooth");
-                if (enableBluetoothCallback != null) {
-                    enableBluetoothCallback.success();
+        switch (requestCode) {
+            case REQUEST_ENABLE_BT:
+                //请求打开蓝牙
+                if (resultCode == Activity.RESULT_OK) {
+                    //蓝牙已经打开
+                    discoverIfNecessary();
+                } else {
+                    //用户不允许打开蓝牙
+                    callback(false, MESSGE_PRINT_CANCELED);
                 }
-            } else {
-                LOG.d(TAG, "User did *NOT* enable Bluetooth");
-                if (enableBluetoothCallback != null) {
-                    enableBluetoothCallback.error("User did not enable Bluetooth");
-                }
-            }
-
-            enableBluetoothCallback = null;
-        }
-    }
-
-    /* @Override */
-    public void onRequestPermissionResult(int requestCode, String[] permissions, int[] grantResults) {
-        for(int result:grantResults) {
-            if(result == PackageManager.PERMISSION_DENIED) {
-                LOG.d(TAG, "User *rejected* Coarse Location Access");
-                this.permissionCallback.error("Location permission not granted.");
-                return;
-            }
-        }
-
-        switch(requestCode) {
-            case REQUEST_ACCESS_COARSE_LOCATION:
-                LOG.d(TAG, "User granted Coarse Location Access");
-                findLowEnergyDevices(permissionCallback, serviceUUIDs, scanSeconds);
-                this.permissionCallback = null;
-                this.serviceUUIDs = null;
-                this.scanSeconds = -1;
                 break;
+
         }
     }
 
-    private UUID uuidFromString(String uuid) {
-        return UUIDHelper.uuidFromString(uuid);
-    }
+private void printtest(){
+            //开启打印
+            //打印的信息
+            StringBuffer buffer = new StringBuffer();
+
+            List<Clothes> mClothes = new ArrayList<>();
+
+            mClothes.add(new Clothes("6651608", "连衣裙(短)", "白色", "精洗", "30.00",
+                    "油性污渍|洗尽量|渍迹会残留|面料发黄", "", ""));
+            mClothes.add(new Clothes("6651609", "T恤", "黑色", "精洗", "40.00", "油性污渍|尽量洗|尽量洗|渍迹会残留|面料发黄", "", ""));
+            mClothes.add(new Clothes("6651610", "真丝T恤", "白色", "精洗", "40.00", "面料发黄|尽量洗|油性污渍|渍迹会残留", "大量去渍", "70.00"));
+
+            String[] detail = {"10001", "3", "1998-01-01 13:22:25", "2018-06-06 18:25:21", "1801856851", "瓯海区茶山街道XXXXXXX", "160.00", "70.00"};
+
+//                    String currTime = DateUtils.getStandardDate(System.currentTimeMillis()); //当前时间
+
+            buffer.append(PrintUtils.print());
+            buffer.append(PrintUtils.printTitle("交易单号:" + detail[0])).append("\n");
+            buffer.append(PrintUtils.printTitle("衣物数量:" + detail[1] + "件")).append("\n\n");
+
+            buffer.append("收衣日期:").append(detail[2]).append("\n");
+            buffer.append("取衣日期:").append(detail[3]).append("\n\n");
+
+            buffer.append("顾客签字:").append("\n");
+            buffer.append("顾客电话:").append(detail[4]).append("\n");
+            buffer.append("顾客地址:").append(detail[5]).append("\n\n");
+
+            buffer.append(PrintUtils.print());
+            buffer.append(PrintUtils.printFourData("名称/条码", "颜色", "服务档次", "价格")).append("\n");
+            buffer.append(PrintUtils.print());
+
+            for (Clothes clothes : mClothes) {
+                buffer.append(PrintUtils.printFourData(clothes.getClothesName(), clothes.getClothesColor(), clothes.getClothesGrade(), clothes.getClothesPrice())).append("\n");
+                buffer.append("|-(" + clothes.getClothesId() + ")" + "@瑕疵(" + clothes.getClothesDefect() + ")").append("\n");
+                if (!clothes.getClothesAdditional().isEmpty()) {
+                    buffer.append("|-@附加服务(不享受折扣):").append("\n");
+                    buffer.append("|-" + clothes.getClothesAdditional() + ": " + "               " + clothes.getClothesAdditionalPrice()).append("\n\n");
+                } else {
+                    buffer.append("\n");
+                }
+            }
+
+/*                for (int i = 0; i < mClothes.size(); i++) {
+                    buffer.append(PrintUtils.printFourData(mClothes.get(i).getClothesName(), mClothes.get(i).getClothesColor(), mClothes.get(i).getClothesGrade(), mClothes.get(i).getClothesPrice())).append("\n");
+                    buffer.append("|-(" + mClothes.get(i).getClothesId() + ")" + "@瑕疵(" + mClothes.get(i).getClothesDefect() + ")").append("\n");
+                    if (!mClothes.get(i).getClothesAdditional().isEmpty()) {
+                        buffer.append("|-@附加服务(不享受折扣):").append("\n");
+                        buffer.append("|-" + mClothes.get(i).getClothesAdditional() + ": " + "               " + mClothes.get(i).getClothesAdditionalPrice()).append("\n\n");
+                    } else {
+                        buffer.append("\n");
+                    }
+                }*/
+
+            buffer.append("交易总额:" + detail[6] + "元(服务费" + detail[7] + "元)").append("\n");
+            buffer.append(PrintUtils.print()).append("\n");
+            buffer.append("应收金额：" + detail[6] + "元").append("\n\n");
+            buffer.append("本店地址：" + "温州市瓯海区xxxxxx").append("\n");
+            buffer.append("服务热线：" + "88668866").append("\n");
+            buffer.append("店员：" + "XXX" + "    " + "店号：" + "007").append("\n");
+            buffer.append(PrintUtils.print());
+
+            String msg = buffer.toString();
+            print(msg);
+        }
+
 
     /**
-     * Reset the BLE scanning options
+     * 创建一个Handler实例，用于接收BluetoothService类返回回来的消息
      */
-    private void resetScanOptions() {
-        this.reportDuplicates = false;
-    }
+    private final Handler mHandler = new Handler() {
+        @Override
+        public void handleMessage(Message msg) {
+            switch (msg.what) {
+                case BlueToothService.MESSAGE_STATE_CHANGE:
+                    switch (msg.arg1) {
+                        case BlueToothService.STATE_CONNECTED:
+                            //已连接
+                            Log.i("Bluetooth", "Connect successful");
+                            print();
+                            break;
+                        case BlueToothService.STATE_CONNECTING:
+                            //正在连接
+                            Log.i("Bluetooth", ".....is connecting");
+                            break;
+                        case BlueToothService.STATE_LISTEN:
+                            //监听连接的到来
+                        case BlueToothService.STATE_NONE:
+                            Log.i("Bluetooth", ".....wait connecting");
+                            break;
+                    }
+                    break;
+                case BlueToothService.MESSAGE_CONNECTION_LOST:
+                    //蓝牙已断开连接
+                    Log.i("Bluetooth", "Device connection was lost");
+                    break;
+                case BlueToothService.MESSAGE_UNABLE_CONNECT:
+                    //无法连接设备
+                    Log.i("Bluetooth", "Unable to connect device");
+                    callback(false, ERROR_MSG_QSPrinterNotFound);
+                    break;
+            }
+        }
+
+    };
 
 }
